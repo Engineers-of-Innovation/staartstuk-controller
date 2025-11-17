@@ -1,0 +1,12 @@
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+# version that uses log (over USB):
+runner = "picotool load --update --verify --execute -t elf"
+# version that uses defmt (over RTT):
+# runner = "probe-rs run --chip RP2040"
+linker = "flip-link"
+
+[build]
+target = "thumbv6m-none-eabi" # Cortex-M0 and Cortex-M0+
+
+[env]
+DEFMT_LOG = "debug"
