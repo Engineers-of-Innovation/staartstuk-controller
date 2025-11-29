@@ -46,13 +46,48 @@ async fn main(spawner: Spawner) {
         embassy_rp::pwm::InputMode::RisingEdge,
         cfg,
     );
-
     spawner.spawn(monitor_flow_task(pwm_input).unwrap());
 
-    let mut adc = Adc::new(p.ADC, Irqs, embassy_rp::adc::Config::default());
-    let mut adc_mcu_temp = embassy_rp::adc::Channel::new_temp_sensor(p.ADC_TEMP_SENSOR);
-    let mut adc_water_temp = embassy_rp::adc::Channel::new_pin(p.PIN_27, Pull::None);
+    let adc = Adc::new(p.ADC, Irqs, embassy_rp::adc::Config::default());
+    let adc_mcu_temp = embassy_rp::adc::Channel::new_temp_sensor(p.ADC_TEMP_SENSOR);
+    let adc_water_temp = embassy_rp::adc::Channel::new_pin(p.PIN_27, Pull::None);
+    spawner.spawn(monitor_temperature_task(adc, adc_mcu_temp, adc_water_temp).unwrap());
+}
 
+#[cfg(feature = "log")]
+#[embassy_executor::task]
+async fn logger_task(driver: Driver<'static, USB>) {
+    embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
+}
+
+#[embassy_executor::task]
+async fn heartbeat_task(mut output: embassy_rp::gpio::Output<'static>) {
+    loop {
+        output.toggle();
+        Timer::after_secs(1).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn monitor_flow_task(pwm: embassy_rp::pwm::Pwm<'static>) {
+    // 22.9 Hz (measured) at about 1,88L/min (by datasheet)
+    let mut ticker = Ticker::every(Duration::from_secs(10));
+    loop {
+        let frequency = pwm.counter() as f32 / 10.0;
+        info!("Flow meter input frequency: {:.1} Hz", frequency);
+        let liter_min = frequency / (22.9 / 1.88);
+        info!("Estimated flow: {:.2} L/min", liter_min);
+        pwm.set_counter(0);
+        ticker.next().await;
+    }
+}
+
+#[embassy_executor::task]
+async fn monitor_temperature_task(
+    mut adc: Adc<'static, embassy_rp::adc::Async>,
+    mut adc_mcu_temp: embassy_rp::adc::Channel<'static>,
+    mut adc_water_temp: embassy_rp::adc::Channel<'static>,
+) {
     loop {
         let mcu_temp = adc.read(&mut adc_mcu_temp).await.unwrap();
         info!("MCU Temp:     {:.1} °C", mcu_convert_to_celsius(mcu_temp));
@@ -91,32 +126,4 @@ fn flow_meter_convert_to_celsius(raw_temp: u16) -> f32 {
     // 1/T = 1/T0 + (1/B) * ln(R/R0)
     let temp_kelvin = 1.0 / (1.0 / T_25C + (1.0 / B_VALUE) * (r_ntc / R_NTC_25C).ln());
     temp_kelvin - 273.15
-}
-
-#[cfg(feature = "log")]
-#[embassy_executor::task]
-async fn logger_task(driver: Driver<'static, USB>) {
-    embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
-}
-
-#[embassy_executor::task]
-async fn heartbeat_task(mut output: embassy_rp::gpio::Output<'static>) {
-    loop {
-        output.toggle();
-        Timer::after_secs(1).await;
-    }
-}
-
-#[embassy_executor::task]
-async fn monitor_flow_task(pwm: embassy_rp::pwm::Pwm<'static>) {
-    // 22.9 Hz (measured) at about 1,88L/min (by datasheet)
-    let mut ticker = Ticker::every(Duration::from_secs(10));
-    loop {
-        let frequency = pwm.counter() as f32 / 10.0;
-        info!("Flow meter input frequency: {:.1} Hz", frequency);
-        let liter_min = frequency / (22.9 / 1.88);
-        info!("Estimated flow: {:.2} L/min", liter_min);
-        pwm.set_counter(0);
-        ticker.next().await;
-    }
 }
