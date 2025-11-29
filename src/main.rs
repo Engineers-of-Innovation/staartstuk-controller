@@ -9,6 +9,7 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::Pull;
 #[cfg(feature = "log")]
 use embassy_rp::peripherals::USB;
+use embassy_rp::pwm::SetDutyCycle;
 #[cfg(feature = "log")]
 use embassy_rp::usb::Driver;
 use embassy_time::{Duration, Ticker, Timer};
@@ -52,6 +53,28 @@ async fn main(spawner: Spawner) {
     let adc_mcu_temp = embassy_rp::adc::Channel::new_temp_sensor(p.ADC_TEMP_SENSOR);
     let adc_water_temp = embassy_rp::adc::Channel::new_pin(p.PIN_27, Pull::None);
     spawner.spawn(monitor_temperature_task(adc, adc_mcu_temp, adc_water_temp).unwrap());
+
+    // PWM for water pump control, slowly ramp up duty cycle to limit inrush current
+    let desired_freq_hz = 10_000;
+    let clock_freq_hz = embassy_rp::clocks::clk_sys_freq();
+    let divider = 16u8;
+    let period = (clock_freq_hz / (desired_freq_hz * divider as u32)) as u16 - 1;
+
+    let mut c = embassy_rp::pwm::Config::default();
+    c.top = period;
+    c.divider = divider.into();
+    let mut pwm_output = embassy_rp::pwm::Pwm::new_output_b(p.PWM_SLICE3, p.PIN_23, c.clone());
+    pwm_output.set_duty_cycle_fully_off().unwrap();
+    for pump_duty_cycle in (0..=100).step_by(5) {
+        pwm_output.set_duty_cycle_percent(pump_duty_cycle).unwrap();
+        info!("Pump duty cycle set to {}%", pump_duty_cycle);
+        Timer::after(Duration::from_millis(50)).await;
+    }
+    pwm_output.set_duty_cycle_fully_on().unwrap();
+
+    loop {
+        Timer::after(Duration::from_secs(1)).await;
+    }
 }
 
 #[cfg(feature = "log")]
