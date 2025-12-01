@@ -9,6 +9,7 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::Pull;
 #[cfg(feature = "log")]
 use embassy_rp::peripherals::USB;
+use embassy_rp::pio_programs::uart::{PioUartTx, PioUartTxProgram};
 use embassy_rp::pwm::SetDutyCycle;
 #[cfg(feature = "log")]
 use embassy_rp::usb::Driver;
@@ -16,10 +17,34 @@ use embassy_time::{Duration, Ticker, Timer};
 use micromath::F32Ext;
 use {defmt_rtt as _, panic_probe as _};
 
+// Wrapper to implement embedded-hal 0.2.x blocking Write trait for PioUartTx
+struct PioUartTxWrapper<'a, PIO: embassy_rp::pio::Instance, const SM: usize>(
+    PioUartTx<'a, PIO, SM>,
+);
+
+impl<'a, PIO: embassy_rp::pio::Instance, const SM: usize> embedded_hal::blocking::serial::Write<u8>
+    for PioUartTxWrapper<'a, PIO, SM>
+{
+    type Error = core::convert::Infallible;
+
+    fn bwrite_all(&mut self, buffer: &[u8]) -> Result<(), Self::Error> {
+        for &byte in buffer {
+            // Block on the async write operation
+            embassy_futures::block_on(self.0.write_u8(byte));
+        }
+        Ok(())
+    }
+
+    fn bflush(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
 bind_interrupts!(struct Irqs {
     #[cfg(feature = "log")]
     USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<USB>;
     ADC_IRQ_FIFO => embassy_rp::adc::InterruptHandler;
+    PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO0>;
 });
 
 #[embassy_executor::main]
@@ -71,6 +96,34 @@ async fn main(spawner: Spawner) {
         Timer::after(Duration::from_millis(50)).await;
     }
     pwm_output.set_duty_cycle_fully_on().unwrap();
+
+    // Initialize stepper motor driver TMC2209
+    let tmc_enable = embassy_rp::gpio::Output::new(p.PIN_14, embassy_rp::gpio::Level::Low); // Active low
+    core::mem::forget(tmc_enable);
+    let tmc_step = embassy_rp::gpio::Output::new(p.PIN_7, embassy_rp::gpio::Level::Low);
+    let tmc_direction = embassy_rp::gpio::Output::new(p.PIN_6, embassy_rp::gpio::Level::High);
+    core::mem::forget(tmc_step);
+    core::mem::forget(tmc_direction);
+
+    // PIO-based UART TX on GPIO15 for TMC2209, because this IO is not connected to a hardware UART (TX)
+    let embassy_rp::pio::Pio {
+        mut common, sm0, ..
+    } = embassy_rp::pio::Pio::new(p.PIO0, Irqs);
+
+    // Load the PIO UART TX program
+    let tx_program = PioUartTxProgram::new(&mut common);
+    let tmc_tx = PioUartTx::new(115200, &mut common, sm0, p.PIN_15, &tx_program);
+    let mut tmc_tx_wrapper = PioUartTxWrapper(tmc_tx);
+
+    // Initialise tracking state for the registers we care about.
+    // - Enable UART controlled velocity but in the stopped state.
+    // - Enable the `pdn_disable` field necessary for UART comms.
+    let mut gconf = tmc2209::reg::GCONF::default();
+    let mut vactual = tmc2209::reg::VACTUAL::ENABLED_STOPPED;
+    vactual.set(-1000);
+    gconf.set_pdn_disable(true);
+    tmc2209::send_write_request(0, gconf, &mut tmc_tx_wrapper).unwrap();
+    tmc2209::send_write_request(0, vactual, &mut tmc_tx_wrapper).unwrap();
 
     loop {
         Timer::after(Duration::from_secs(1)).await;
